@@ -283,7 +283,21 @@ export class ApprovalIntentService {
       ApprovalIntentStatus.CANCELLED,
     );
     intent.completedAt = new Date();
-    const saved = await this.repo.save(intent);
+    // Atomic claim: only a row still `proposed` may be withdrawn, so a
+    // cancellation can never clobber an execution that started between our
+    // read and this write (and two racing cancellations cannot both win).
+    const claimed = await this.repo.update(
+      { id: intent.id, status: ApprovalIntentStatus.PROPOSED },
+      { status: intent.status, completedAt: intent.completedAt },
+    );
+    if (!claimed.affected) {
+      const current = await this.get(intentId);
+      throw new ConflictException(
+        `Only proposed intents can be cancelled; ${intentId} is ` +
+          `${current.status}`,
+      );
+    }
+    const saved = intent;
 
     // Best-effort: the direction of travel is already safe (the action can
     // no longer run) and the row itself records who and when; a failed
@@ -334,7 +348,20 @@ export class ApprovalIntentService {
       ApprovalIntentStatus.EXPIRED,
     );
     intent.completedAt = new Date();
-    return this.repo.save(intent);
+    // Same atomic claim as cancellation: never rewrite a row that an
+    // execution (or another expiry) has already moved on from.
+    const claimed = await this.repo.update(
+      { id: intent.id, status: ApprovalIntentStatus.PROPOSED },
+      { status: intent.status, completedAt: intent.completedAt },
+    );
+    if (!claimed.affected) {
+      const current = await this.get(intentId);
+      throw new ConflictException(
+        `Only proposed intents can be expired; ${intentId} is ` +
+          `${current.status}`,
+      );
+    }
+    return intent;
   }
 
   /**
@@ -371,6 +398,19 @@ export class ApprovalIntentService {
       { status: ApprovalIntentStatus.EXECUTING, startedAt },
     );
     if (!claimed.affected) {
+      // Whoever won the claim either claimed it (executing) or already
+      // finished/cancelled it; report the observed state honestly.
+      const current = await this.get(intentId);
+      const terminal =
+        current.status === ApprovalIntentStatus.COMPLETED ||
+        current.status === ApprovalIntentStatus.FAILED ||
+        current.status === ApprovalIntentStatus.CANCELLED ||
+        current.status === ApprovalIntentStatus.EXPIRED;
+      if (terminal) {
+        throw new ConflictException(
+          `Intent ${intentId} is ${current.status} and can no longer execute`,
+        );
+      }
       throw new ConflictException(
         `Intent ${intentId} was claimed by another execution`,
       );
