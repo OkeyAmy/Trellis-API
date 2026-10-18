@@ -1,157 +1,28 @@
-import { createHash } from "crypto";
 import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
   ServiceUnavailableException,
 } from "@nestjs/common";
-import { FindOperator } from "typeorm";
 import {
   ApprovalIntentService,
   isMaintainerApprovalEnforced,
 } from "./approval-intent.service";
-import { ApprovalIntent } from "../entities/approval-intent.entity";
-import { ExportSigningService } from "../algorithms/export-signing.service";
-import { SensitiveActionAuditService } from "../sensitive-actions/sensitive-action-audit.service";
 import { SensitiveAction } from "../sensitive-actions/sensitive-action.enum";
 import { ApprovalIntentStatus } from "./approval-intent.types";
-import {
-  hashReceipt,
-  verifyReceipt,
-  ReceiptSigner,
-} from "./approval-intent.receipt";
+import { hashReceipt, verifyReceipt } from "./approval-intent.receipt";
 import { approvalIntentFingerprint } from "./approval-intent.fingerprint";
+import { createService, proposedIntent } from "./testing/approval-intent.testkit";
 
 /*
  * Unit tests for the approval intent service (#220): proposal, single-use
  * execution with signed receipts, cancellation, expiry and verification.
  *
- * The repository is an in-memory fake implementing exactly the surface the
- * service uses, so the atomic-claim semantics (`update` guarded by status)
- * are observable without a database.
+ * Fixtures — the in-memory repository whose conditional `update` mirrors a
+ * guarded SQL UPDATE, the signer and the builders — come from
+ * ./testing/approval-intent.testkit, shared with the concurrency suite so
+ * both observe identical claim semantics.
  */
-
-interface FakeRow extends Partial<ApprovalIntent> {
-  id: string;
-}
-
-function createFakeRepo() {
-  const rows = new Map<string, FakeRow>();
-  let sequence = 0;
-
-  const matches = (row: FakeRow, where: Record<string, unknown>): boolean =>
-    Object.entries(where).every(([key, condition]) => {
-      if (condition instanceof FindOperator) {
-        const actual = (row as unknown as Record<string, unknown>)[key];
-        if (condition.type === "lessThan") {
-          return (
-            actual instanceof Date &&
-            condition.value instanceof Date &&
-            actual.getTime() < condition.value.getTime()
-          );
-        }
-        return false;
-      }
-      return (row as unknown as Record<string, unknown>)[key] === condition;
-    });
-
-  return {
-    rows,
-    create: jest.fn((partial: Partial<ApprovalIntent>) => ({ ...partial })),
-    save: jest.fn(async (entity: ApprovalIntent) => {
-      if (!entity.id) {
-        sequence += 1;
-        entity.id = `intent-${sequence}`;
-      }
-      rows.set(entity.id, { ...(entity as FakeRow) });
-      return entity;
-    }),
-    findOne: jest.fn(async ({ where }: { where: Record<string, unknown> }) => {
-      for (const row of rows.values()) {
-        if (matches(row, where)) return { ...row };
-      }
-      return null;
-    }),
-    find: jest.fn(
-      async ({
-        where,
-        take,
-      }: {
-        where: Record<string, unknown>;
-        take?: number;
-      }) => {
-        const found = [...rows.values()].filter((row) => matches(row, where));
-        return take ? found.slice(0, take) : found;
-      },
-    ),
-    update: jest.fn(
-      async (
-        criteria: Record<string, unknown>,
-        patch: Partial<ApprovalIntent>,
-      ) => {
-        let affected = 0;
-        for (const row of rows.values()) {
-          if (matches(row, criteria)) {
-            Object.assign(row, patch);
-            affected += 1;
-          }
-        }
-        return { affected };
-      },
-    ),
-  };
-}
-
-const TEST_KEY = "approval-intent-test-key";
-
-function createSigner(): ReceiptSigner & { sign: jest.Mock } {
-  const sign = jest.fn((payload: string) =>
-    createHash("sha256").update(`${TEST_KEY}:${payload}`).digest("hex"),
-  );
-  return {
-    sign,
-    verify: (payload: string, signature: string) => sign(payload) === signature,
-  };
-}
-
-function createService(overrides: {
-  repo?: ReturnType<typeof createFakeRepo>;
-  signer?: ReceiptSigner & { sign: jest.Mock };
-  audit?: { recordSensitiveAction: jest.Mock };
-} = {}) {
-  const repo = overrides.repo ?? createFakeRepo();
-  const signer = overrides.signer ?? createSigner();
-  const audit =
-    overrides.audit ?? { recordSensitiveAction: jest.fn().mockResolvedValue({}) };
-
-  const service = new ApprovalIntentService(
-    repo as never,
-    signer as unknown as ExportSigningService,
-    audit as unknown as SensitiveActionAuditService,
-  );
-  return { service, repo, signer, audit };
-}
-
-const actor = { id: "admin-1", role: "ADMIN" };
-
-function proposeInput(over: Record<string, unknown> = {}) {
-  return {
-    action: SensitiveAction.ROLE_ASSIGNED,
-    actor,
-    resourceType: "user",
-    resourceId: "user-7",
-    reason: "Promotion approved in ticket OPS-142",
-    payload: { role: "MAINTAINER" },
-    ...over,
-  };
-}
-
-async function proposedIntent(
-  service: ApprovalIntentService,
-  over: Record<string, unknown> = {},
-): Promise<ApprovalIntent> {
-  return service.propose(proposeInput(over) as never);
-}
 
 describe("ApprovalIntentService", () => {
   describe("propose", () => {
