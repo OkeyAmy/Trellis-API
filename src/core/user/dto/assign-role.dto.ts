@@ -1,4 +1,4 @@
-import { ApiProperty } from "@nestjs/swagger";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { IsEnum, IsOptional, IsString, MaxLength } from "class-validator";
 import { Role } from "src/common/guard/roles.enum";
 
@@ -23,4 +23,15 @@ export class AssignRoleDto {
   @IsString()
   @MaxLength(2000)
   reason?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Approval intent authorizing this change (#220). Only consulted " +
+      "when MAINTAINER_APPROVAL_INTENTS_ENFORCED is on; the intent must " +
+      "commit to this exact action, user and role.",
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  approvalIntentId?: string;
 }
