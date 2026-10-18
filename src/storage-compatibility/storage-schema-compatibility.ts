@@ -101,7 +101,7 @@ function migrationFileVersion(fileName: string): MigrationVersion | null {
 
 /**
  * Discover the same migration locations configured by src/config/typeorm.config.ts:
- * src/migrations/* and any nested **/migration/* directory.
+ * src/migrations/* and any nested **\/migration/* directory.
  *
  * Only timestamp-prefixed migration source/build files are considered. The
  * timestamp is TypeORM's durable migration identity and is also what is stored
