@@ -8,6 +8,52 @@ import {
   businessFailureTotal,
   conversionFunnelTotal,
 } from "../monitoring/monitoring.metrics";
+import {
+  LOG_OPERATION_MAX_LENGTH,
+  LOG_SHORT_FIELD_MAX_LENGTH,
+  TelemetryGuard,
+} from "./telemetry-guard";
+
+/** Metric names the guard budgets label values against (own call sites only). */
+const BUSINESS_OPERATION_DURATION_METRIC = "business_operation_duration_seconds";
+const BUSINESS_OPERATION_TOTAL_METRIC = "business_operation_total";
+const BUSINESS_FAILURE_TOTAL_METRIC = "business_failure_total";
+const CONVERSION_FUNNEL_METRIC = "conversion_funnel_total";
+const DB_WRITE_DURATION_METRIC = "db_write_duration_seconds";
+
+/**
+ * Length-cap a free-text log field. Non-strings (only reachable when the typed
+ * contract is bypassed) are stringified so one hostile value cannot emit an
+ * unbounded line.
+ */
+function truncateField(value: string | undefined, max: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return String(value);
+  return value.length > max ? value.slice(0, max) : value;
+}
+
+/**
+ * Replace oversized (or unserializable) metadata with a bounded placeholder
+ * for the log copy, so a single abusive payload cannot inflate one line.
+ * The original object stays intact on the event returned to the caller.
+ */
+function capMetadataForLog(
+  metadata: Record<string, unknown> | undefined,
+  maxBytes: number,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(metadata);
+  } catch {
+    return { _unserializable: true };
+  }
+  if (json === undefined) return undefined;
+  if (json.length > maxBytes) {
+    return { _truncated: true, _original_bytes: json.length };
+  }
+  return metadata;
+}
 
 export type DbWriteOperation = "save" | "insert" | "update" | "delete";
 
@@ -82,11 +128,25 @@ const STELLAR_SECRET_REGEX = /\bS[A-Z2-7]{55}\b/g;
  * TelemetryService provides standardized structured logging and Prometheus metrics
  * for business-critical operations, failure rates, and conversion funnels.
  *
- * Implements strict sensitive data sanitization (passwords, tokens, private keys, secrets).
+ * Implements strict sensitive data sanitization (passwords, tokens, private keys, secrets),
+ * high-cardinality label protection and deterministic log sampling through
+ * {@link TelemetryGuard} (#214): unsafe label values are rejected as-is and
+ * aggregated, log payloads are capped, and non-failure log lines are sampled
+ * so abusive input volume cannot flood dashboards or stdout. Metrics series
+ * are never sampled.
  */
 @Injectable()
 export class TelemetryService {
   private readonly logger = new Logger("Telemetry");
+
+  /**
+   * High-cardinality protection between callers and the telemetry sinks:
+   * rejects unsafe label values as-is (normalizing/budgeting them instead of
+   * minting series), caps log payloads, and samples non-failure log lines.
+   * Public for inspection in tests; configuration is read from
+   * `TELEMETRY_LABEL_BUDGET` and `TELEMETRY_LOG_SAMPLE_RATE` at construction.
+   */
+  readonly guard = new TelemetryGuard();
 
   /**
    * Recursively mask sensitive fields in objects, arrays, and strings.
@@ -125,6 +185,33 @@ export class TelemetryService {
   }
 
   /**
+   * Serialize the log copy of a telemetry event: free-text fields are
+   * length-capped, metadata oversized for one line is replaced by a bounded
+   * placeholder, and the whole object runs through the sensitive-data mask.
+   * The event returned to the caller keeps its original values — these caps
+   * bound what we write to stdout, not the API surface.
+   */
+  private stringifyForLog(event: TelemetryEvent): string {
+    const forLog = {
+      ...event,
+      operation: truncateField(event.operation, LOG_OPERATION_MAX_LENGTH),
+      actor_type: truncateField(event.actor_type, LOG_SHORT_FIELD_MAX_LENGTH),
+      correlation_id: truncateField(
+        event.correlation_id,
+        LOG_SHORT_FIELD_MAX_LENGTH,
+      ),
+      error_code: truncateField(event.error_code, LOG_SHORT_FIELD_MAX_LENGTH),
+      funnel: truncateField(event.funnel, LOG_SHORT_FIELD_MAX_LENGTH),
+      step: truncateField(event.step, LOG_SHORT_FIELD_MAX_LENGTH),
+      metadata: capMetadataForLog(
+        event.metadata,
+        this.guard.logMetadataMaxBytes,
+      ),
+    };
+    return JSON.stringify(this.maskSensitiveData(forLog));
+  }
+
+  /**
    * Record a business operation execution, updating Prometheus metrics and
    * emitting a structured JSON log.
    */
@@ -158,28 +245,60 @@ export class TelemetryService {
       event.metadata = this.maskSensitiveData(options.metadata);
     }
 
-    // 1. Prometheus metric updates
+    // 1. Prometheus metric updates. Label values pass through the guard:
+    //    normalized (identifiers/secrets collapsed), budgeted per
+    //    metric::label, and rejections counted — so no caller can mint
+    //    unbounded series. Series are never sampled; every observation
+    //    still counts exactly once.
     try {
       businessOperationDuration
-        .labels(options.operation, actorType, options.result)
+        .labels(
+          ...this.guard.boundLabels(
+            BUSINESS_OPERATION_DURATION_METRIC,
+            ["operation", "actor_type", "result"],
+            [options.operation, actorType, options.result],
+          ),
+        )
         .observe(latencyMs / 1000);
 
       businessOperationTotal
-        .labels(options.operation, actorType, options.result)
+        .labels(
+          ...this.guard.boundLabels(
+            BUSINESS_OPERATION_TOTAL_METRIC,
+            ["operation", "actor_type", "result"],
+            [options.operation, actorType, options.result],
+          ),
+        )
         .inc();
 
       if (options.result === "failure") {
         businessFailureTotal
-          .labels(options.operation, actorType, options.errorCode || "UNKNOWN_ERROR")
+          .labels(
+            ...this.guard.boundLabels(
+              BUSINESS_FAILURE_TOTAL_METRIC,
+              ["operation", "actor_type", "error_code"],
+              [
+                options.operation,
+                actorType,
+                options.errorCode || "UNKNOWN_ERROR",
+              ],
+            ),
+          )
           .inc();
       }
 
       if (options.funnel && options.step) {
         conversionFunnelTotal
           .labels(
-            options.funnel,
-            options.step,
-            options.result === "success" ? "completed" : "failed",
+            ...this.guard.boundLabels(
+              CONVERSION_FUNNEL_METRIC,
+              ["funnel", "step", "status"],
+              [
+                options.funnel,
+                options.step,
+                options.result === "success" ? "completed" : "failed",
+              ],
+            ),
           )
           .inc();
       }
@@ -187,12 +306,23 @@ export class TelemetryService {
       this.logger.warn(`Failed to update Prometheus metrics: ${metricError.message}`);
     }
 
-    // 2. Structured log emission
-    const payload = JSON.stringify(event);
-    if (options.result === "failure") {
-      this.logger.warn(`[TELEMETRY] ${payload}`);
-    } else {
-      this.logger.log(`[TELEMETRY] ${payload}`);
+    // 2. Structured log emission. Failures are never sampled out; eligible
+    //    lines follow the configured rate (default: every line). Serialization
+    //    failures degrade to a warning — telemetry must never break the call
+    //    it is observing.
+    if (this.guard.shouldEmitLog("operation", options.result === "failure")) {
+      try {
+        const payload = this.stringifyForLog(event);
+        if (options.result === "failure") {
+          this.logger.warn(`[TELEMETRY] ${payload}`);
+        } else {
+          this.logger.log(`[TELEMETRY] ${payload}`);
+        }
+      } catch (logError) {
+        this.logger.warn(
+          `Failed to serialize telemetry log: ${logError?.message ?? logError}`,
+        );
+      }
     }
 
     return event;
@@ -208,21 +338,46 @@ export class TelemetryService {
     metadata?: Record<string, unknown>,
   ): void {
     try {
-      conversionFunnelTotal.labels(funnel, step, status).inc();
+      conversionFunnelTotal
+        .labels(
+          ...this.guard.boundLabels(
+            CONVERSION_FUNNEL_METRIC,
+            ["funnel", "step", "status"],
+            [funnel, step, status],
+          ),
+        )
+        .inc();
     } catch (metricError) {
       this.logger.warn(`Failed to update funnel metric: ${metricError.message}`);
+    }
+
+    // Funnel lines are sampled like other non-failure events; a failed
+    // transition is a failure signal and is always emitted.
+    if (!this.guard.shouldEmitLog("funnel", status === "failed")) {
+      return;
     }
 
     const event = {
       timestamp: new Date().toISOString(),
       event_type: "funnel_transition",
-      funnel,
-      step,
+      funnel: truncateField(funnel, LOG_SHORT_FIELD_MAX_LENGTH),
+      step: truncateField(step, LOG_SHORT_FIELD_MAX_LENGTH),
       status,
-      metadata: metadata ? this.maskSensitiveData(metadata) : undefined,
+      metadata: capMetadataForLog(
+        metadata ? this.maskSensitiveData(metadata) : undefined,
+        this.guard.logMetadataMaxBytes,
+      ),
     };
 
-    this.logger.log(`[TELEMETRY_FUNNEL] ${JSON.stringify(event)}`);
+    try {
+      this.logger.log(
+        `[TELEMETRY_FUNNEL] ${JSON.stringify(this.maskSensitiveData(event))}`,
+      );
+    } catch (logError) {
+      this.logger.warn(
+        `Failed to serialize funnel log: ${logError?.message ?? logError}`,
+      );
+    }
   }
 
   /**
@@ -260,7 +415,13 @@ export class TelemetryService {
     const entity = options.entity || "unknown";
     try {
       dbWriteDuration
-        .labels(options.operation, entity, status)
+        .labels(
+          ...this.guard.boundLabels(
+            DB_WRITE_DURATION_METRIC,
+            ["operation", "entity", "status"],
+            [options.operation, entity, status],
+          ),
+        )
         .observe(Math.max(0, options.durationSeconds));
     } catch (metricError) {
       this.logger.warn(
