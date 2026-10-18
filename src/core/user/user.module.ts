@@ -8,9 +8,15 @@ import { RoleSeederService } from "./role-seeder.service";
 import { AuthModule } from "src/core/auth/auth.module";
 import { AdminTwoFactorGuard } from "src/core/auth/guards/admin-two-factor.guard";
 import { SensitiveActionAuditModule } from "src/infrastructure/audit/sensitive-actions/sensitive-action-audit.module";
+import { ApprovalIntentModule } from "src/infrastructure/audit/approval-intents/approval-intent.module";
 
 @Module({
-  imports: [TypeOrmModule.forFeature([User]), AuthModule, SensitiveActionAuditModule],
+  imports: [
+    TypeOrmModule.forFeature([User]),
+    AuthModule,
+    SensitiveActionAuditModule,
+    ApprovalIntentModule,
+  ],
   controllers: [UserController, AdminRoleController],
   providers: [UserService, RoleSeederService, AdminTwoFactorGuard],
   exports: [UserService, TypeOrmModule],

@@ -29,6 +29,7 @@ import { InvitationModule } from "./core/invitation/invitation.module";
 
 // Modules – infrastructure
 import { AuditModule } from "./infrastructure/audit/audit.module";
+import { ApprovalIntentModule } from "./infrastructure/audit/approval-intents/approval-intent.module";
 
 // Modules – blockchain
 import { OracleModule } from "./blockchain/oracle/oracle.module";
@@ -349,6 +350,7 @@ import { ReleaseModule } from "./common/release/release.module";
     ProfileModule,
     InvitationModule,
     AuditModule,
+    ApprovalIntentModule,
     OracleModule,
     PortfolioModule,
     RiskManagementModule,
