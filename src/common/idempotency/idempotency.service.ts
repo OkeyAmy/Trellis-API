@@ -28,6 +28,30 @@ export interface IdempotentOutcome<T = unknown> {
   key: string;
 }
 
+/**
+ * True when `error` is a unique-index violation (Postgres SQLSTATE 23505),
+ * detected on either the raw driver error or TypeORM's `QueryFailedError`
+ * wrapper. The message fallback covers drivers that expose no code.
+ *
+ * This is the signal that a concurrent duplicate won the `(scope, key)`
+ * insert race; the claim loop maps it to a replay or a 409 rather than
+ * letting it surface as a 500.
+ */
+export function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    code?: unknown;
+    driverError?: { code?: unknown };
+    message?: unknown;
+  };
+  const code = candidate.code ?? candidate.driverError?.code;
+  if (code === "23505") return true;
+  return (
+    typeof candidate.message === "string" &&
+    candidate.message.includes("duplicate key")
+  );
+}
+
 export interface ExecuteIdempotentParams<T> {
   key: string;
   scope: string;
@@ -115,47 +139,52 @@ export class IdempotencyService {
     const key = this.assertValidKey(params.key);
     const { scope, requestHash } = params;
 
-    const existing = await this.repo.findOne({
-      where: { scope, idempotencyKey: key },
-    });
+    // Bounded claim loop: insert the IN_PROGRESS marker, and if a concurrent
+    // duplicate wins the unique index between our lookup and our insert, the
+    // second pass re-reads their record and either replays it (completed with
+    // the same payload), rejects with 409 (in progress / different payload),
+    // or — their attempt already failed — claims the key for us. Two passes
+    // are enough: pass 2 observes whatever record the winner left behind.
+    let record: IdempotencyRecord | null = null;
+    for (let attempt = 0; attempt < 2 && record === null; attempt += 1) {
+      const existing = await this.repo.findOne({
+        where: { scope, idempotencyKey: key },
+      });
 
-    if (existing) {
-      if (existing.requestHash !== requestHash) {
-        throw new ConflictException(
-          "Idempotency-Key was already used for a different request payload"
+      if (existing) {
+        const outcome = await this.resolveExisting<T>(
+          existing,
+          requestHash,
+          key
         );
+        if (outcome) return outcome;
+        // Expired or failed record was removed; fall through and claim.
       }
 
-      if (this.isExpired(existing)) {
-        await this.repo.remove(existing);
-      } else if (existing.status === IdempotencyRecordStatus.COMPLETED) {
-        return {
-          replayed: true,
-          statusCode: existing.responseCode ?? 200,
-          body: this.readStoredBody<T>(existing),
-          key,
-        };
-      } else if (existing.status === IdempotencyRecordStatus.IN_PROGRESS) {
-        throw new ConflictException(
-          "A request with this Idempotency-Key is already in progress"
-        );
-      } else {
-        // A previous attempt failed: drop the marker so the retry can run.
-        await this.repo.remove(existing);
+      const claim = this.repo.create({
+        scope,
+        idempotencyKey: key,
+        requestHash,
+        status: IdempotencyRecordStatus.IN_PROGRESS,
+        responseCode: null,
+        responseBody: null,
+        failureReason: null,
+        expiresAt: this.expiry(params.ttlSeconds),
+      });
+      try {
+        await this.repo.save(claim);
+        record = claim;
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        // Lost the insert race; the loop re-reads the winner's record.
       }
     }
 
-    const record = this.repo.create({
-      scope,
-      idempotencyKey: key,
-      requestHash,
-      status: IdempotencyRecordStatus.IN_PROGRESS,
-      responseCode: null,
-      responseBody: null,
-      failureReason: null,
-      expiresAt: this.expiry(params.ttlSeconds),
-    });
-    await this.repo.save(record);
+    if (record === null) {
+      throw new ConflictException(
+        "A request with this Idempotency-Key is already in progress"
+      );
+    }
 
     try {
       const { statusCode, body } = await params.handler();
@@ -186,6 +215,49 @@ export class IdempotencyService {
     await this.repo.remove(expired);
     this.logger.log(`Purged ${expired.length} expired idempotency records`);
     return expired.length;
+  }
+
+  /**
+   * Resolves a record already holding `(scope, key)` for this request's hash:
+   * returns a replay outcome when the prior run completed, throws 409 when it
+   * is still running or the payload differs, or returns `null` when the record
+   * was cleared (expired, or a previous attempt failed) and the caller may
+   * claim the key.
+   */
+  private async resolveExisting<T>(
+    existing: IdempotencyRecord,
+    requestHash: string,
+    key: string
+  ): Promise<IdempotentOutcome<T> | null> {
+    if (existing.requestHash !== requestHash) {
+      throw new ConflictException(
+        "Idempotency-Key was already used for a different request payload"
+      );
+    }
+
+    if (this.isExpired(existing)) {
+      await this.repo.remove(existing);
+      return null;
+    }
+
+    if (existing.status === IdempotencyRecordStatus.COMPLETED) {
+      return {
+        replayed: true,
+        statusCode: existing.responseCode ?? 200,
+        body: this.readStoredBody<T>(existing),
+        key,
+      };
+    }
+
+    if (existing.status === IdempotencyRecordStatus.IN_PROGRESS) {
+      throw new ConflictException(
+        "A request with this Idempotency-Key is already in progress"
+      );
+    }
+
+    // A previous attempt failed: drop the marker so the retry can run.
+    await this.repo.remove(existing);
+    return null;
   }
 
   private isExpired(record: IdempotencyRecord): boolean {

@@ -59,8 +59,13 @@ class FakeIdempotencyRepository {
     return [...this.rows];
   }
 
-  async remove(record: IdempotencyRecord): Promise<IdempotencyRecord> {
-    this.rows = this.rows.filter((row) => row !== record);
+  async remove(
+    record: IdempotencyRecord | IdempotencyRecord[]
+  ): Promise<IdempotencyRecord | IdempotencyRecord[]> {
+    // TypeORM's `remove` accepts a single entity or an array (purgeExpired
+    // passes the array it found); resolve to a list of removal targets.
+    const targets = Array.isArray(record) ? record : [record];
+    this.rows = this.rows.filter((row) => !targets.includes(row));
     return record;
   }
 }

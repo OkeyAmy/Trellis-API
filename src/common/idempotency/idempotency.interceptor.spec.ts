@@ -75,6 +75,10 @@ function buildHarness(overrides: {
 
   const context = {
     getType: () => "http",
+    // The interceptor reads decorator options through the reflector, which
+    // needs a handler/class pair from the execution context.
+    getHandler: () => function idempotencyTarget() {},
+    getClass: () => class IdempotencySpecTarget {},
     switchToHttp: () => ({
       getRequest: () => request,
       getResponse: () => response,
