@@ -1,6 +1,9 @@
 import { Column, Entity, Index } from "typeorm";
 import { BaseEntity } from "../../../common/database/entities/base.entity";
-import { ApprovalIntentStatus } from "../approval-intents/approval-intent.types";
+import {
+  ApprovalIntentStatus,
+  SignedIntentReceipt,
+} from "../approval-intents/approval-intent.types";
 
 /**
  * One maintainer approval intent (#220).
@@ -92,6 +95,14 @@ export class ApprovalIntent extends BaseEntity {
   /** HMAC-SHA256 over `receiptHash`. */
   @Column({ type: "varchar", length: 64, nullable: true })
   receiptSignature: string | null;
+
+  /**
+   * The exact signed receipt document. Verification re-canonicalizes this
+   * document (sorted keys) before hashing, so a jsonb round-trip — which
+   * does not preserve key order — cannot invalidate a receipt.
+   */
+  @Column({ type: "jsonb", nullable: true })
+  receipt: SignedIntentReceipt | null;
 
   @Column({ type: "timestamptz", nullable: true })
   signedAt: Date | null;
