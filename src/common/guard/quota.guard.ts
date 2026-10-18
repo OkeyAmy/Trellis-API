@@ -21,7 +21,7 @@ import {
 
 const MONTHLY_QUOTA_LIMITS: Record<RateLimitTier, number> = {
   free: 10_000,
-  pro: 1_000_000,
+  paid: 1_000_000,
   enterprise: Number.POSITIVE_INFINITY,
 };
 
