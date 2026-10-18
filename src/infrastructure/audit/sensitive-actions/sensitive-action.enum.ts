@@ -18,6 +18,7 @@ export enum SensitiveActionScope {
   PROTOCOL_CONFIG = "protocol-config",
   COMPLIANCE = "compliance",
   PORTFOLIO = "portfolio",
+  APPROVAL = "approval",
 }
 
 export enum SensitiveAction {
@@ -80,6 +81,12 @@ export enum SensitiveAction {
   PORTFOLIO_STATE_TRANSITION = "portfolio.state.transition",
   POSITION_STATE_TRANSITION = "defi.position.state.transition",
   TRANSACTION_STATE_TRANSITION = "transaction.state.transition",
+
+  // Maintainer approval flow (#220). The executed action records its own
+  // event; these three describe the approval lifecycle around it.
+  MAINTAINER_ACTION_PROPOSED = "maintainer.action.proposed",
+  MAINTAINER_ACTION_CANCELLED = "maintainer.action.cancelled",
+  MAINTAINER_ACTION_EXECUTED = "maintainer.action.executed",
 }
 
 export interface SensitiveActionDefinition {
@@ -334,6 +341,27 @@ export const SENSITIVE_ACTION_CATALOGUE: Record<
   [SensitiveAction.LIFECYCLE_STATE_TRANSITION]: {
     scope: SensitiveActionScope.COMPLIANCE,
     description: "A core record underwent a deterministic lifecycle state transition.",
+    reasonRequired: false,
+    capturesState: true,
+  },
+  [SensitiveAction.MAINTAINER_ACTION_PROPOSED]: {
+    scope: SensitiveActionScope.APPROVAL,
+    description:
+      "A maintainer declared a signed intent to perform a high-impact action.",
+    reasonRequired: true,
+    capturesState: true,
+  },
+  [SensitiveAction.MAINTAINER_ACTION_CANCELLED]: {
+    scope: SensitiveActionScope.APPROVAL,
+    description:
+      "A proposed approval intent was withdrawn before it could execute.",
+    reasonRequired: true,
+    capturesState: false,
+  },
+  [SensitiveAction.MAINTAINER_ACTION_EXECUTED]: {
+    scope: SensitiveActionScope.APPROVAL,
+    description:
+      "An approval intent reached a terminal state and its signed receipt was recorded.",
     reasonRequired: false,
     capturesState: true,
   },
